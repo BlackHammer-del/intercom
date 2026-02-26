@@ -1,0 +1,19 @@
+{
+  "name": "intercom-release-gate",
+  "version": "1.0.0",
+  "description": "P2P release checklist and deployment gate on Intercom (Trac Network)",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "pear run --tmp-store --no-pre . --peer-store-name admin --msb-store-name admin-msb --subnet-channel release-gate-v1",
+    "peer":  "pear run --tmp-store --no-pre . --peer-store-name peer1 --msb-store-name peer1-msb --subnet-channel release-gate-v1",
+    "test": "node release.test.js"
+  },
+  "keywords": ["release","checklist","approval","deploy","p2p","trac","intercom","pear"],
+  "license": "MIT",
+  "dependencies": {},
+  "pear": {
+    "name": "intercom-release-gate",
+    "type": "terminal"
+  }
+}
