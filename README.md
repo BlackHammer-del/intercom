@@ -1,28 +1,26 @@
 # Intercom Release Gate
 
-P2P release checklist and deployment gate on Trac Intercom.
+Deterministic release checklist and deployment gate built on the Trac Intercom peer runtime.
 
-This app manages software release readiness across peers with:
-- checklist status (`passed` / `failed`)
-- multi-party approvals
-- blocked/unblock workflow
-- deployment gating (`ready` required before `deploy`)
+This app runs on the real `trac-peer` + `trac-msb` stack and supports:
+- release creation (`release_new`)
+- checklist updates (`release_check`)
+- multi-approver gating (`release_approve`)
+- block/unblock flow (`release_unblock`)
+- deploy gate (`release_deploy`)
+- listing/state queries (`release_list`, `release_state`)
 
-All state transitions are deterministic contract updates replicated across peers.
+Live updates are published on sidechannels named `release-<releaseId>`.
 
 **Trac Address:** `trac16en65mzfka4vxyaaaup0873fd2p0lyssmuausn00r0ma0g8r2n2sgdsp9j`
 
-## Run
-
-Requirements:
-- Node.js 22+
-- Pear runtime (`npm i -g pear`)
-
-Install:
+## Install
 
 ```bash
 npm install
 ```
+
+## Run
 
 Start admin peer:
 
@@ -30,52 +28,36 @@ Start admin peer:
 pear run --tmp-store --no-pre . --peer-store-name admin --msb-store-name admin-msb --subnet-channel release-gate-v1
 ```
 
-Join as second peer (with bootstrap hex from admin):
+Start second peer (replace bootstrap with admin's printed subnet bootstrap):
 
 ```bash
 pear run --tmp-store --no-pre . --peer-store-name peer1 --msb-store-name peer1-msb --subnet-channel release-gate-v1 --subnet-bootstrap <hex>
 ```
 
-Local-only dev mode (no Pear intercom required):
-
-```bash
-node index.js
-```
-
 ## Commands
 
-Create a release gate:
+Create release:
 
 ```bash
 /tx --command '{"op":"release_new","service":"api-gateway","version":"v1.4.2","approvers":["qa","sec"],"minApprovals":2,"checks":["unit-tests","integration-tests","smoke-prod"]}'
 ```
 
-Update check status:
+Update checks:
 
 ```bash
 /tx --command '{"op":"release_check","releaseId":"<id>","checkId":"c1","status":"passed","note":"green on CI"}'
 /tx --command '{"op":"release_check","releaseId":"<id>","checkId":"c2","status":"failed","note":"timeout in staging"}'
 ```
 
-Approve release:
+Approve and deploy:
 
 ```bash
 /tx --command '{"op":"release_approve","releaseId":"<id>"}'
-```
-
-Unblock a blocked release (owner only):
-
-```bash
 /tx --command '{"op":"release_unblock","releaseId":"<id>","reason":"Fix merged"}'
-```
-
-Deploy when ready (owner only):
-
-```bash
 /tx --command '{"op":"release_deploy","releaseId":"<id>"}'
 ```
 
-State/list:
+Read state:
 
 ```bash
 /tx --command '{"op":"release_state","releaseId":"<id>"}'
@@ -83,77 +65,35 @@ State/list:
 /tx --command '{"op":"release_list","filter":"ready"}'
 ```
 
-Live sidechannel updates:
+Sidechannel helper commands:
 
 ```bash
-/sc_join --channel "release-<releaseId>"
+/release_join --releaseId "<id>"
+/release_ping --releaseId "<id>" --message "hello"
 ```
 
-## Proof of Functionality
-
-Run tests:
+## Tests
 
 ```bash
 npm test
 ```
 
-Expected output:
+Expected:
 
 ```text
 release.test.js: all tests passed
 ```
 
-## Proof of Work
+## Troubleshooting
 
-### Environment
-- OS: Windows
-- Node: `v24.14.0`
-- App mode: Local CLI (`node index.js`)
+- If startup fails with dependency errors, run `npm install` again and ensure Git is available on PATH.
+- If `--subnet-bootstrap` is rejected, pass a 64-char hex string.
+- If a release cannot deploy, verify all checks are `passed` and approval count meets `minApprovals`.
 
-### Automated Test Evidence
-Command:
+## Iteration Log
 
-```bash
-npm.cmd test
-```
-
-Expected output:
-
-```text
-release.test.js: all tests passed
-```
-
-### Manual End-to-End Evidence
-Start:
-
-```bash
-node index.js
-```
-
-Run these commands in one session:
-
-```text
-/tx --sender owner --command '{"op":"release_new","service":"api-gateway","version":"v1.4.2","approvers":["qa","sec"],"minApprovals":2,"checks":["unit-tests","integration-tests","smoke-prod"]}'
-/tx --sender qa --command '{"op":"release_check","releaseId":"<id>","checkId":"c1","status":"passed","note":"unit tests passed"}'
-/tx --sender sec --command '{"op":"release_check","releaseId":"<id>","checkId":"c2","status":"passed","note":"integration passed"}'
-/tx --sender owner --command '{"op":"release_check","releaseId":"<id>","checkId":"c3","status":"passed","note":"smoke passed"}'
-/tx --sender qa --command '{"op":"release_approve","releaseId":"<id>"}'
-/tx --sender sec --command '{"op":"release_approve","releaseId":"<id>"}'
-/tx --sender owner --command '{"op":"release_deploy","releaseId":"<id>"}'
-/tx --sender owner --command '{"op":"release_state","releaseId":"<id>"}'
-```
-
-Expected final proof:
-- `release_deploy` returns `{ "ok": true, "status": "deployed" }`
-- `release_state` returns `"status": "deployed"`
-
-### Video Proof Checklist
-Record one continuous clip (30-90s) showing:
-1. Repo + README opened.
-2. `npm.cmd test` passing.
-3. `node index.js` startup.
-4. Full command flow above.
-5. Final `release_state` with `status: "deployed"`.
-
-Include this commit hash in submission:
-- `c6cec42`
+1. Detected runtime issue: app booted without `Pear.intercom` and entered local shim mode.
+2. Replaced shim bootstrap with real `trac-peer` + `trac-msb` startup path.
+3. Moved business logic to pure domain module and wired root peer `contract.js`/`protocol.js`.
+4. Added sidechannel runtime and release update broadcasts.
+5. Re-ran tests and runtime checks.

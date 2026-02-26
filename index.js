@@ -1,138 +1,181 @@
-import { ReleaseGateContract } from './contract/contract.js'
-import { ReleaseGateProtocol } from './contract/protocol.js'
+import fs from 'fs'
+import path from 'path'
+import b4a from 'b4a'
+import PeerWallet from 'trac-wallet'
+import { Peer, Wallet, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer'
+import { MainSettlementBus } from 'trac-msb/src/index.js'
+import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js'
+import { ensureTextCodecs } from 'trac-peer/src/textCodec.js'
+import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js'
+import { Terminal } from 'trac-peer/src/terminal/index.js'
+import ReleaseGateProtocol from './protocol.js'
+import ReleaseGateContract from './contract.js'
+import Sidechannel from './features/sidechannel/index.js'
 
-const intercom = resolveIntercom()
-const devMode = !globalThis?.Pear?.intercom
+const { env, storeLabel, flags } = getPearRuntime()
 
-const rawState = await intercom.getState('release-gate-contract').catch(() => null)
-const contract = ReleaseGateContract.deserialize(rawState)
-const protocol = new ReleaseGateProtocol(intercom)
+const peerStoreNameRaw = (flags['peer-store-name'] && String(flags['peer-store-name'])) || env.PEER_STORE_NAME || storeLabel || 'peer'
+const peerStoresDirectory = ensureTrailingSlash(
+  (flags['peer-stores-directory'] && String(flags['peer-stores-directory'])) ||
+  env.PEER_STORES_DIRECTORY ||
+  'stores/'
+)
 
-intercom.onTransaction(async (tx) => {
-  const result = contract.apply(tx)
-  await intercom.setState('release-gate-contract', contract.serialize())
+const msbStoreName =
+  (flags['msb-store-name'] && String(flags['msb-store-name'])) ||
+  env.MSB_STORE_NAME ||
+  `${peerStoreNameRaw}-msb`
 
-  const cmd = typeof tx.command === 'string' ? safeParse(tx.command) : tx.command
-  const op = cmd?.op
-  const releaseId = cmd?.releaseId || result?.releaseId
-  const trackedOps = new Set([
-    'release_new',
-    'release_check',
-    'release_approve',
-    'release_unblock',
-    'release_deploy',
-    'release_cancel'
-  ])
+const msbStoresDirectory = ensureTrailingSlash(
+  (flags['msb-stores-directory'] && String(flags['msb-stores-directory'])) ||
+  env.MSB_STORES_DIRECTORY ||
+  'stores/'
+)
 
-  if (releaseId && trackedOps.has(op)) {
-    await protocol.broadcast(releaseId, {
-      op,
-      releaseId,
-      status: result?.status,
-      message: result?.ok ? 'Applied successfully' : undefined,
-      error: result?.ok ? undefined : result?.error
-    })
-  }
+const subnetChannel =
+  (flags['subnet-channel'] && String(flags['subnet-channel'])) ||
+  env.SUBNET_CHANNEL ||
+  'release-gate-v1'
 
-  return result
-})
+const subnetBootstrapHex =
+  (flags['subnet-bootstrap'] && String(flags['subnet-bootstrap'])) ||
+  env.SUBNET_BOOTSTRAP ||
+  null
 
-intercom.onSideChannelMessage('release-help', async (_msg, channel) => {
-  await intercom.sideChannelSend(channel, ReleaseGateProtocol.help())
-})
+const parseCsvList = (raw) => {
+  if (!raw) return null
+  return String(raw)
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+}
 
-console.log('')
-console.log('Intercom Release Gate ready')
-console.log('--------------------------')
-console.log('Create gate:')
-console.log('/tx --command \'{"op":"release_new","service":"api-gateway","version":"v1.4.2","approvers":["qa","sec"],"minApprovals":2,"checks":["unit-tests","integration-tests","smoke-prod"]}\'')
-console.log('')
-console.log('Then:')
-console.log('/tx --command \'{"op":"release_check","releaseId":"<id>","checkId":"c1","status":"passed"}\'')
-console.log('/tx --command \'{"op":"release_approve","releaseId":"<id>"}\'')
-console.log('/tx --command \'{"op":"release_deploy","releaseId":"<id>"}\'')
-console.log('')
-console.log('Help channel: /sc_join --channel "release-help"')
-console.log('')
+const peerDhtBootstrapRaw =
+  (flags['peer-dht-bootstrap'] && String(flags['peer-dht-bootstrap'])) ||
+  (flags['dht-bootstrap'] && String(flags['dht-bootstrap'])) ||
+  env.PEER_DHT_BOOTSTRAP ||
+  env.DHT_BOOTSTRAP ||
+  ''
+const peerDhtBootstrap = parseCsvList(peerDhtBootstrapRaw)
 
-const isBareRuntime = Boolean(globalThis.Bare || process?.versions?.bare)
-if (devMode && !isBareRuntime) startLocalCli(intercom)
-if (devMode && isBareRuntime) console.log('Pear.intercom is unavailable in this runtime. App is in no-op dev mode.')
+const msbDhtBootstrapRaw =
+  (flags['msb-dht-bootstrap'] && String(flags['msb-dht-bootstrap'])) ||
+  env.MSB_DHT_BOOTSTRAP ||
+  ''
+const msbDhtBootstrap = parseCsvList(msbDhtBootstrapRaw)
 
-function safeParse (text) {
+const readHexFile = (filePath, byteLength) => {
   try {
-    return JSON.parse(text)
-  } catch (_) {
-    return null
-  }
-}
-
-function resolveIntercom () {
-  const runtimeIntercom = globalThis?.Pear?.intercom
-  if (runtimeIntercom) return runtimeIntercom
-  return createLocalIntercom()
-}
-
-function createLocalIntercom () {
-  const state = new Map()
-  const txHandlers = []
-  const scHandlers = new Map()
-
-  return {
-    async getState (key) { return state.has(key) ? state.get(key) : null },
-    async setState (key, value) { state.set(key, value) },
-    onTransaction (handler) { txHandlers.push(handler) },
-    async submitTransaction (tx) {
-      const results = []
-      for (const handler of txHandlers) results.push(await handler(tx))
-      return results[results.length - 1]
-    },
-    onSideChannelMessage (channel, handler) { scHandlers.set(channel, handler) },
-    async sideChannelSend (_channel, _message) {},
-    async emitSideChannel (channel, msg) {
-      const handler = scHandlers.get(channel)
-      if (handler) await handler(msg, channel)
+    if (fs.existsSync(filePath)) {
+      const hex = fs.readFileSync(filePath, 'utf8').trim().toLowerCase()
+      if (/^[0-9a-f]+$/.test(hex) && hex.length === byteLength * 2) return hex
     }
-  }
+  } catch (_) {}
+  return null
 }
 
-async function startLocalCli (shim) {
-  console.log('Running in local dev mode (Pear.intercom not available).')
-  console.log('Local tx: /tx --sender <address> --command \'<json>\'')
-  console.log('Exit: /exit')
+const subnetBootstrapFile = path.join(peerStoresDirectory, peerStoreNameRaw, 'subnet-bootstrap.hex')
+let subnetBootstrap = subnetBootstrapHex ? subnetBootstrapHex.trim().toLowerCase() : null
+if (subnetBootstrap && !/^[0-9a-f]{64}$/.test(subnetBootstrap)) {
+  throw new Error('Invalid --subnet-bootstrap. Provide 32-byte hex (64 chars).')
+}
+if (!subnetBootstrap) subnetBootstrap = readHexFile(subnetBootstrapFile, 32)
 
-  const { default: readline } = await import('node:readline')
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  rl.on('line', async (line) => {
-    const text = String(line || '').trim()
-    if (!text) return
-    if (text === '/exit') {
-      rl.close()
-      process.exit(0)
-      return
-    }
-    if (!text.startsWith('/tx')) {
-      console.log('Unknown command')
-      return
-    }
-    const senderMatch = text.match(/--sender\s+("[^"]+"|'[^']+'|\S+)/)
-    const commandMatch = text.match(/--command\s+(.+)$/)
-    const sender = senderMatch ? unwrap(senderMatch[1]) : 'local-user'
-    const rawCommand = commandMatch ? unwrap(commandMatch[1]) : null
-    if (!rawCommand) {
-      console.log('Usage: /tx --sender <address> --command \'{"op":"release_list"}\'')
-      return
-    }
-    const result = await shim.submitTransaction({
-      sender,
-      timestamp: Date.now(),
-      command: rawCommand
-    })
-    console.log(JSON.stringify(result, null, 2))
-  })
+const msbOptions = {
+  storeName: msbStoreName,
+  storesDirectory: msbStoresDirectory,
+  enableInteractiveMode: false
+}
+if (msbDhtBootstrap) msbOptions.dhtBootstrap = msbDhtBootstrap
+const msbConfig = createMsbConfig(MSB_ENV.MAINNET, msbOptions)
+
+const effectivePeerDhtBootstrap =
+  peerDhtBootstrap ||
+  (Array.isArray(msbConfig.dhtBootstrap) && msbConfig.dhtBootstrap.length > 0
+    ? msbConfig.dhtBootstrap
+    : undefined)
+
+const msbBootstrapHex = b4a.toString(msbConfig.bootstrap, 'hex')
+if (subnetBootstrap && subnetBootstrap === msbBootstrapHex) {
+  throw new Error('Subnet bootstrap cannot equal MSB bootstrap.')
 }
 
-function unwrap (value) {
-  if (!value) return value
-  return value.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1')
+const peerOptions = {
+  storesDirectory: peerStoresDirectory,
+  storeName: peerStoreNameRaw,
+  bootstrap: subnetBootstrap || null,
+  channel: subnetChannel,
+  enableInteractiveMode: true,
+  enableBackgroundTasks: true,
+  enableUpdater: true,
+  replicate: true
 }
+if (effectivePeerDhtBootstrap) peerOptions.dhtBootstrap = effectivePeerDhtBootstrap
+const peerConfig = createPeerConfig(PEER_ENV.MAINNET, peerOptions)
+
+const ensureKeypairFile = async (keyPairPath) => {
+  if (fs.existsSync(keyPairPath)) return
+  fs.mkdirSync(path.dirname(keyPairPath), { recursive: true })
+  await ensureTextCodecs()
+  const wallet = new PeerWallet()
+  await wallet.ready
+  if (!wallet.secretKey) await wallet.generateKeyPair()
+  wallet.exportToFile(keyPairPath, b4a.alloc(0))
+}
+
+await ensureKeypairFile(msbConfig.keyPairPath)
+await ensureKeypairFile(peerConfig.keyPairPath)
+
+console.log('=============== STARTING MSB ===============')
+const msb = new MainSettlementBus(msbConfig)
+await msb.ready()
+
+console.log('=============== STARTING PEER ===============')
+const peer = new Peer({
+  config: peerConfig,
+  msb,
+  wallet: new Wallet(),
+  protocol: ReleaseGateProtocol,
+  contract: ReleaseGateContract
+})
+await peer.ready()
+
+const effectiveSubnetBootstrapHex = peer.base?.key
+  ? peer.base.key.toString('hex')
+  : b4a.isBuffer(peer.config.bootstrap)
+    ? peer.config.bootstrap.toString('hex')
+    : String(peer.config.bootstrap ?? '').toLowerCase()
+
+if (!subnetBootstrap) {
+  fs.mkdirSync(path.dirname(subnetBootstrapFile), { recursive: true })
+  fs.writeFileSync(subnetBootstrapFile, `${effectiveSubnetBootstrapHex}\n`)
+}
+
+const sidechannelEntry = '0000release-gate'
+const sidechannel = new Sidechannel(peer, {
+  channels: [sidechannelEntry],
+  entryChannel: sidechannelEntry,
+  allowRemoteOpen: true,
+  autoJoinOnOpen: true,
+  inviteRequired: false,
+  welcomeRequired: false
+})
+peer.sidechannel = sidechannel
+await sidechannel.start()
+
+console.log('')
+console.log('================ RELEASE GATE ================')
+console.log('MSB network bootstrap:', msbBootstrapHex)
+console.log('Peer subnet bootstrap:', effectiveSubnetBootstrapHex)
+console.log('Peer subnet channel:', subnetChannel)
+console.log('Peer pubkey (hex):', peer.wallet.publicKey)
+console.log('Peer trac address:', peer.wallet.address ?? null)
+console.log('Sidechannel entry:', sidechannelEntry)
+console.log('==============================================')
+console.log('')
+console.log('Use /tx with release_* commands, for example:')
+console.log('/tx --command \'{"op":"release_list"}\'')
+console.log('')
+
+const terminal = new Terminal(peer)
+await terminal.start()
